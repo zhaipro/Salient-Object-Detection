@@ -1,65 +1,95 @@
-import tensorflow as tf
+import cv2
 import numpy as np
-import os
-from scipy import misc
-import argparse
-import sys
+import tensorflow.compat.v1 as tf
 
-g_mean = np.array(([126.88,120.24,112.19])).reshape([1,1,3])
-output_folder = "./test_output"
 
-def rgba2rgb(img):
-	return img[:,:,:3]*np.expand_dims(img[:,:,3],2)
+class SalienceModel:
 
-def main(args):
-	
-	if not os.path.exists(output_folder):
-		os.mkdir(output_folder)	
-	
-	gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction = args.gpu_fraction)
-	with tf.Session(config=tf.ConfigProto(gpu_options = gpu_options)) as sess:
-		saver = tf.train.import_meta_graph('./meta_graph/my-model.meta')
-		saver.restore(sess,tf.train.latest_checkpoint('./salience_model'))
-		image_batch = tf.get_collection('image_batch')[0]
-		pred_mattes = tf.get_collection('mask')[0]
+    def open(self):
+        self.sess = tf.Session()
+        self.sess.__enter__()
+        self.saver = tf.train.import_meta_graph('./meta_graph/my-model.meta')
+        self.saver.restore(self.sess, tf.train.latest_checkpoint('./salience_model'))
+        self.image_batch = tf.get_collection('image_batch')[0]
+        self.pred_mattes = tf.get_collection('mask')[0]
 
-		if args.rgb_folder:
-			rgb_pths = os.listdir(args.rgb_folder)
-			for rgb_pth in rgb_pths:
-				rgb = misc.imread(os.path.join(args.rgb_folder,rgb_pth))
-				if rgb.shape[2]==4:
-					rgb = rgba2rgb(rgb)
-				origin_shape = rgb.shape
-				rgb = np.expand_dims(misc.imresize(rgb.astype(np.uint8),[320,320,3],interp="nearest").astype(np.float32)-g_mean,0)
+    def close(self):
+        self.sess.__exit__(None, None, None)
 
-				feed_dict = {image_batch:rgb}
-				pred_alpha = sess.run(pred_mattes,feed_dict = feed_dict)
-				final_alpha = misc.imresize(np.squeeze(pred_alpha),origin_shape)
-				misc.imsave(os.path.join(output_folder,rgb_pth),final_alpha)
+    @staticmethod
+    def preprocessing(im):
+        im = cv2.resize(im, (320, 320), interpolation=0)
+        im = im.astype('float32')
+        return np.expand_dims(im[..., ::-1] - [126.88, 120.24, 112.19], 0)
 
-		else:
-			rgb = misc.imread(args.rgb)
-			if rgb.shape[2]==4:
-				rgb = rgba2rgb(rgb)
-			origin_shape = rgb.shape[:2]
-			rgb = np.expand_dims(misc.imresize(rgb.astype(np.uint8),[320,320,3],interp="nearest").astype(np.float32)-g_mean,0)
+    def predict(self, im):
+        h, w = im.shape[:2]
+        im = self.preprocessing(im)
+        feed_dict = {self.image_batch: im}
+        pred_alpha = self.sess.run(self.pred_mattes, feed_dict=feed_dict)
+        final_alpha = cv2.resize(np.squeeze(pred_alpha), (w, h))
+        return final_alpha
 
-			feed_dict = {image_batch:rgb}
-			pred_alpha = sess.run(pred_mattes,feed_dict = feed_dict)
-			final_alpha = misc.imresize(np.squeeze(pred_alpha),origin_shape)
-			misc.imsave(os.path.join(output_folder,'alpha.png'),final_alpha)
+    def find_rect(self, im):
+        org_h, org_w = im.shape[:2]
+        inputs = self.preprocessing(im)
+        cur_h, cur_w = inputs.shape[1:3]
+        feed_dict = {self.image_batch: inputs}
+        pred_alpha = self.sess.run(self.pred_mattes, feed_dict=feed_dict)
+        pred_alpha = np.squeeze(pred_alpha)
+        pred_alpha = (pred_alpha * 255).astype('uint8')
+        ret, pred_alpha = cv2.threshold(pred_alpha, 127, 255, cv2.THRESH_BINARY)
 
-def parse_arguments(argv):
-	parser = argparse.ArgumentParser()
+        cnts, _ = cv2.findContours(pred_alpha, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return
 
-	parser.add_argument('--rgb', type=str,
-		help='input rgb',default = None)
-	parser.add_argument('--rgb_folder', type=str,
-		help='input rgb',default = None)
-	parser.add_argument('--gpu_fraction', type=float,
-		help='how much gpu is needed, usually 4G is enough',default = 1.0)
-	return parser.parse_args(argv)
+        x_min, y_min = float('inf'), float('inf')
+        x_max, y_max = -float('inf'), -float('inf')
+        for cnt in cnts:
+            x, y, w, h = cv2.boundingRect(cnt)
+            x1 = x * org_w // cur_w
+            y1 = y * org_h // cur_h
+            x2 = (x + w) * org_w // cur_w
+            y2 = (y + h) * org_h // cur_h
+            x_min, y_min = min(x_min, x1), min(y_min, y1)
+            x_max, y_max = max(x_max, x2), max(y_max, y2)
+
+        cv2.rectangle(im, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+
+        return x_min, y_min, x_max, y_max
+
+
+def main():
+    import os, sys
+    m = SalienceModel()
+    m.open()
+    if os.path.isfile(sys.argv[1]):
+        ifn = sys.argv[1]
+        if ifn.endswith('.MP4'):
+            cap = cv2.VideoCapture(ifn)
+            ret, im = cap.read()
+            cap.release()
+        else:
+            im = cv2.imread(ifn)
+        final_alpha = m.predict(im)
+        rect = m.find_rect(im)
+        if len(sys.argv) > 2:
+            ofn = sys.argv[2]
+            cv2.imwrite(ofn, im)
+        else:
+            cv2.imshow('a', im)
+            cv2.waitKey()
+    elif os.path.isdir(sys.argv[1]):
+        path = sys.argv[1]
+        for fn in os.listdir(path):
+            ifn = os.path.join(path, fn)
+            ofn = os.path.join('test_output', fn)
+            im = cv2.imread(ifn)
+            final_alpha = m.predict(im)
+            cv2.imwrite(ofn, final_alpha * 255)
+    m.close()
 
 
 if __name__ == '__main__':
-    main(parse_arguments(sys.argv[1:]))
+    main()
